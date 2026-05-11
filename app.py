@@ -1,9 +1,11 @@
 import os
 
-import streamlit as st
-from pymongo import MongoClient
+import certifi
 import pandas as pd
 import plotly.express as px
+import streamlit as st
+from pymongo import MongoClient
+from pymongo.errors import ServerSelectionTimeoutError
 
 st.set_page_config(page_title="Mini Airbnb", layout="wide")
 st.markdown("""
@@ -33,7 +35,23 @@ def init_connection():
     if not uri:
         st.error("Missing MONGODB_URI. Add it to Streamlit secrets or environment variables.")
         st.stop()
-    return MongoClient(uri)
+    try:
+        client = MongoClient(
+            uri,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=10000,
+        )
+        client.admin.command("ping")
+        return client
+    except ServerSelectionTimeoutError as exc:
+        st.error("Could not connect to MongoDB Atlas.")
+        st.info(
+            "If you are running locally with macOS system Python, upgrade to Python 3.11+ "
+            "or use a virtual environment built from a newer Python release."
+        )
+        st.code(str(exc))
+        st.stop()
 
 client = init_connection()
 db = client["sample_airbnb"]
