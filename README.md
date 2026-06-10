@@ -47,3 +47,23 @@ streamlit run app.py
 ```
 
 Deploy บน Streamlit Community Cloud โดยตั้งค่า `MONGODB_URI` ใน app secrets
+
+## Gemini setup for app2.py
+
+1. Go to Google AI Studio and create a Gemini API key.
+2. Copy `secret.example.toml` to `secret.toml`.
+3. Set these values in `secret.toml`.
+
+```toml
+AI_PROVIDER = "gemini"
+GEMINI_API_KEY = "paste-your-gemini-api-key-here"
+GEMINI_MODEL = "gemini-2.0-flash"
+```
+
+4. Run the app.
+
+```bash
+streamlit run app2.py
+```
+
+To switch back to Ollama, set `AI_PROVIDER = "ollama"` or remove `AI_PROVIDER`.

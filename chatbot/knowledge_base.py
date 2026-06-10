@@ -131,6 +131,31 @@ def normalize_text(text: str) -> str:
     return text
 
 
+EARLY_RETIREMENT_ANSWER = (
+    "ถ้าหมายถึงสิทธิชราภาพของประกันสังคม อายุ 45 ปียังไม่สามารถรับเงินชราภาพได้ครับ "
+    "โดยทั่วไปต้องมีอายุครบ 55 ปีบริบูรณ์ และความเป็นผู้ประกันตนสิ้นสุดลงก่อน จึงจะยื่นขอรับเงินชราภาพได้ "
+    "จำนวนเงินที่จะได้รับขึ้นกับมาตรา ประวัติการส่งเงินสมทบ จำนวนเดือนที่ส่ง และฐานค่าจ้างที่ใช้คำนวณ "
+    "ดังนั้นตอนอายุ 45 จะยังบอกยอดรับจริงไม่ได้ ควรตรวจประวัติเงินสมทบในระบบประกันสังคมหรือสอบถามสายด่วน 1506 เพื่อประเมินสิทธิครับ"
+)
+
+
+def find_early_retirement_answer(question: str) -> dict[str, Any] | None:
+    normalized_question = normalize_text(question)
+    retirement_keywords = ["เกษียณ", "ชราภาพ", "บำนาญ", "บำเหน็จ"]
+    has_retirement_signal = any(normalize_text(keyword) in normalized_question for keyword in retirement_keywords)
+    has_early_age_signal = any(age in normalized_question for age in ["45", "อายุ45", "45ปี"])
+
+    if not (has_retirement_signal and has_early_age_signal):
+        return None
+
+    return {
+        "topic": "เกษียณก่อนอายุ 55",
+        "answer": EARLY_RETIREMENT_ANSWER,
+        "score": 99,
+        "matched": True,
+    }
+
+
 def score_question_topics(question: str) -> list[dict[str, Any]]:
     normalized_question = normalize_text(question)
     topic_scores: list[dict[str, Any]] = []
@@ -183,6 +208,10 @@ def is_high_confidence_match(
 
 
 def infer_topic_for_question(question: str) -> str | None:
+    early_retirement_answer = find_early_retirement_answer(question)
+    if early_retirement_answer:
+        return early_retirement_answer["topic"]
+
     normalized_question = normalize_text(question)
     topic_scores = score_question_topics(question)
     if not topic_scores:
@@ -210,6 +239,10 @@ def infer_topic_for_question(question: str) -> str | None:
 
 
 def find_best_answer(question: str) -> dict[str, Any]:
+    early_retirement_answer = find_early_retirement_answer(question)
+    if early_retirement_answer:
+        return early_retirement_answer
+
     normalized_question = normalize_text(question)
     topic_scores = score_question_topics(question)
     best_match = topic_scores[0] if topic_scores else None

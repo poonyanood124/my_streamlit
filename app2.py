@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,9 @@ ROOT_SECRETS_PATH = PROJECT_ROOT / "secret.toml"
 
 DEFAULT_OLLAMA_MODEL = "gemma2:latest"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_AI_PROVIDER = "gemini"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_MAX_OUTPUT_TOKENS = 1024
 AI_FALLBACK_TOPIC = "AI fallback"
 OUT_OF_SCOPE_TOPIC = "out_of_scope"
 NON_CANONICAL_TOPICS = {"fallback", AI_FALLBACK_TOPIC, OUT_OF_SCOPE_TOPIC}
@@ -418,6 +422,28 @@ def get_ollama_base_url() -> str:
     return (load_secret_value("OLLAMA_BASE_URL") or DEFAULT_OLLAMA_BASE_URL).rstrip("/")
 
 
+def get_ai_provider() -> str:
+    return (load_secret_value("AI_PROVIDER") or DEFAULT_AI_PROVIDER).strip().lower()
+
+
+def get_gemini_api_key() -> str | None:
+    return load_secret_value("GEMINI_API_KEY")
+
+
+def get_gemini_model() -> str:
+    return load_secret_value("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+
+
+def get_max_output_tokens() -> int:
+    raw_value = load_secret_value("AI_MAX_OUTPUT_TOKENS")
+    if not raw_value:
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    try:
+        return max(256, min(4096, int(raw_value)))
+    except ValueError:
+        return DEFAULT_MAX_OUTPUT_TOKENS
+
+
 def is_social_security_question(question: str) -> bool:
     normalized = normalize_text(question)
     if not normalized:
@@ -512,7 +538,156 @@ def build_ai_messages(question: str) -> list[dict[str, str]]:
     return messages
 
 
-def generate_ai_answer(question: str) -> dict[str, Any]:
+def extract_gemini_text(response_payload: dict[str, Any]) -> str:
+    parts = (
+        response_payload.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [])
+    )
+    return "\n".join(part.get("text", "") for part in parts if part.get("text")).strip()
+
+
+def get_gemini_finish_reason(response_payload: dict[str, Any]) -> str | None:
+    candidates = response_payload.get("candidates") or []
+    if not candidates:
+        return None
+    finish_reason = candidates[0].get("finishReason")
+    return str(finish_reason) if finish_reason else None
+
+
+def build_gemini_payload(question: str) -> dict[str, Any]:
+    messages = build_ai_messages(question)
+    system_parts = [
+        {"text": message["content"]}
+        for message in messages
+        if message["role"] == "system" and message.get("content")
+    ]
+    contents = [
+        {
+            "role": "model" if message["role"] == "assistant" else "user",
+            "parts": [{"text": message["content"]}],
+        }
+        for message in messages
+        if message["role"] in {"user", "assistant"} and message.get("content")
+    ]
+
+    payload: dict[str, Any] = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.1,
+            "topP": 0.8,
+            "maxOutputTokens": get_max_output_tokens(),
+        },
+    }
+    if system_parts:
+        payload["systemInstruction"] = {"parts": system_parts}
+    return payload
+
+
+def generate_gemini_answer(question: str) -> dict[str, Any]:
+    scope_signal = get_scope_signal(question)
+    model = get_gemini_model()
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return {
+            "topic": AI_FALLBACK_TOPIC,
+            "answer": (
+                "ยังไม่ได้ตั้งค่า Gemini API key กรุณาเพิ่ม GEMINI_API_KEY ใน secret.toml "
+                "หรือ environment variable ก่อนใช้งาน"
+            ),
+            "score": 0,
+            "matched": False,
+            "source": "ai_config_missing",
+            "model": model,
+            "status_text": "Gemini API key is missing",
+        }
+
+    model_path = model if model.startswith("models/") else f"models/{model}"
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"{quote(model_path, safe='/')}:generateContent?key={quote(api_key, safe='')}"
+    )
+
+    try:
+        request = Request(
+            url=endpoint,
+            data=json.dumps(build_gemini_payload(question)).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=120) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+        answer_text = extract_gemini_text(response_payload)
+        if not answer_text:
+            raise ValueError("Empty Gemini response")
+        return {
+            "topic": AI_FALLBACK_TOPIC,
+            "answer": answer_text,
+            "score": 0,
+            "matched": False,
+            "source": "gemini",
+            "model": model,
+            "status_text": f"Gemini fallback ทำงานสำเร็จ ({scope_signal['label']})",
+        }
+    except HTTPError as exc:
+        error_type = type(exc).__name__
+        error_body = exc.read().decode("utf-8", errors="ignore")
+        error_message = ""
+        error_status = ""
+        try:
+            error_payload = json.loads(error_body)
+            error_info = error_payload.get("error", {})
+            error_message = str(error_info.get("message", ""))
+            error_status = str(error_info.get("status", ""))
+        except Exception:
+            error_message = error_body
+
+        if exc.code == 429 or error_status == "RESOURCE_EXHAUSTED":
+            answer_text = (
+                "Gemini ใช้งานไม่ได้เพราะ quota ของ API key/project นี้เต็มหรือยังไม่ได้เปิด billing "
+                "จาก error ของ Google ตอนนี้ free tier limit เป็น 0 สำหรับโมเดลนี้ "
+                "ให้ไปตรวจที่ Google AI Studio / Google Cloud billing และหน้า rate limit ก่อนครับ"
+            )
+            status_text = "Gemini quota exceeded or billing is not enabled"
+        else:
+            answer_text = (
+                "Gemini ยังตอบไม่ได้ในรอบนี้ กรุณาตรวจสอบ API key, quota, billing "
+                "หรือชื่อโมเดลที่ตั้งค่าไว้"
+            )
+            status_text = f"Gemini HTTP error: {exc.code} {error_type} {error_message[:180]}"
+        return {
+            "topic": AI_FALLBACK_TOPIC,
+            "answer": answer_text,
+            "score": 0,
+            "matched": False,
+            "source": "ai_error",
+            "model": model,
+            "status_text": status_text,
+        }
+    except URLError:
+        return {
+            "topic": AI_FALLBACK_TOPIC,
+            "answer": "ยังติดต่อ Gemini ไม่ได้ กรุณาตรวจสอบอินเทอร์เน็ตหรือการเชื่อมต่อ API",
+            "score": 0,
+            "matched": False,
+            "source": "ai_unavailable",
+            "model": model,
+            "status_text": "Gemini server unavailable",
+        }
+    except Exception as exc:
+        error_type = type(exc).__name__
+        return {
+            "topic": AI_FALLBACK_TOPIC,
+            "answer": "Gemini ยังตอบไม่ได้ในรอบนี้ กรุณาตรวจสอบการตั้งค่าแล้วลองใหม่อีกครั้ง",
+            "score": 0,
+            "matched": False,
+            "source": "ai_error",
+            "model": model,
+            "status_text": f"Gemini error: {error_type}",
+        }
+
+
+def generate_ollama_answer(question: str) -> dict[str, Any]:
     scope_signal = get_scope_signal(question)
     model = get_ollama_model()
     base_url = get_ollama_base_url()
@@ -523,7 +698,7 @@ def generate_ai_answer(question: str) -> dict[str, Any]:
         "options": {
             "temperature": 0.1,
             "top_p": 0.8,
-            "num_predict": 300,
+            "num_predict": get_max_output_tokens(),
         },
     }
 
@@ -599,6 +774,13 @@ def generate_ai_answer(question: str) -> dict[str, Any]:
             "model": model,
             "status_text": f"Ollama error: {error_type}",
         }
+
+
+def generate_ai_answer(question: str) -> dict[str, Any]:
+    provider = get_ai_provider()
+    if provider == "gemini":
+        return generate_gemini_answer(question)
+    return generate_ollama_answer(question)
 
 
 def get_collection():
@@ -948,7 +1130,12 @@ def main() -> None:
 
     kb_answer = find_best_answer(prompt)
 
-    if kb_answer.get("matched"):
+    if kb_answer.get("matched") and kb_answer.get("score", 0) >= 90:
+        answer_payload = kb_answer
+        answer_payload.setdefault("source", "knowledge_base")
+        answer_payload.setdefault("model", None)
+        answer_payload.setdefault("status_text", "ตอบจากฐานความรู้")
+    elif kb_answer.get("matched"):
         prompt_with_context = f"""
         ข้อมูลอ้างอิงจากฐานความรู้:
 
